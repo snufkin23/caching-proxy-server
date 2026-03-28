@@ -1,0 +1,6 @@
+.env
+/bin
+
+.DS_Store
+# profiling
+*.prof
