@@ -2,8 +2,10 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"time"
@@ -18,14 +20,32 @@ type ProxyHandler struct {
 	client *http.Client
 }
 
-// NewProxyHandler creates a new proxy handler
+// NewProxyHandler creates a new proxy handler with SSRF protection
 func NewProxyHandler(cache cache.Cache, logger *slog.Logger) *ProxyHandler {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+		if err != nil {
+			return nil, err
+		}
+		for _, ip := range ips {
+			if isPrivateIP(ip) {
+				return nil, fmt.Errorf("access to private IP %s is blocked", ip)
+			}
+		}
+		return (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, network, addr)
+	}
+
 	return &ProxyHandler{
 		cache:  cache,
 		logger: logger,
 		client: &http.Client{
-			Timeout: 30 * time.Second,
-			// Stop after 10 redirects
+			Transport: transport,
+			Timeout:   30 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if len(via) >= 10 {
 					return fmt.Errorf("stopped after 10 redirects")
@@ -37,13 +57,6 @@ func NewProxyHandler(cache cache.Cache, logger *slog.Logger) *ProxyHandler {
 }
 
 // ServeHTTP is the main handler - called for every request
-//
-// Flow:
-// 1. Extract target URL from request
-// 2. If GET request → check cache
-// 3. If cache hit → return cached response
-// 4. If cache miss → fetch from upstream → cache it → return
-// 5. If not GET → just proxy it (no caching)
 func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Only cache GET requests (POST/PUT/DELETE bypass cache)
 	if r.Method != http.MethodGet {
