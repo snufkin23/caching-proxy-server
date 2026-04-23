@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -117,12 +118,8 @@ func (h *ProxyHandler) forwardHeaders(req *http.Request, headers http.Header) {
 
 // serveCachedResponse sends a cached entry to the user
 func (h *ProxyHandler) serveCachedResponse(w http.ResponseWriter, entry *cache.Entry) {
-	// Step 1: Set all original headers
-	for key, values := range entry.Headers {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
+	// Step 1: Set only safe original headers
+	h.copySafeResponseHeaders(w, entry.Headers)
 
 	// Step 2: Add cache metadata headers
 	w.Header().Set("X-Cache-Status", "HIT")
@@ -153,8 +150,8 @@ func (h *ProxyHandler) proxyRequestWithoutCache(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Copy all headers
-	upstreamReq.Header = r.Header.Clone()
+	// Only forward safe headers to prevent credential leakage
+	h.forwardHeaders(upstreamReq, r.Header)
 
 	// Execute request
 	resp, err := h.client.Do(upstreamReq)
@@ -164,12 +161,8 @@ func (h *ProxyHandler) proxyRequestWithoutCache(w http.ResponseWriter, r *http.R
 	}
 	defer resp.Body.Close()
 
-	// Copy response headers
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
+	// Copy safe response headers
+	h.copySafeResponseHeaders(w, resp.Header)
 
 	// Mark as bypassed cache
 	w.Header().Set("X-Cache-Status", "BYPASS")
@@ -179,4 +172,52 @@ func (h *ProxyHandler) proxyRequestWithoutCache(w http.ResponseWriter, r *http.R
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		h.logger.Error("copy response failed", slog.String("error", err.Error()))
 	}
+}
+
+// copySafeResponseHeaders copies only safe headers from upstream response to client
+// and adds standard security headers.
+func (h *ProxyHandler) copySafeResponseHeaders(w http.ResponseWriter, upstreamHeaders http.Header) {
+	// 1. Set Security Headers
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+
+	// 2. Copy Safe Upstream Headers
+	safeHeaders := []string{
+		"Content-Type",
+		"Content-Length",
+		"Content-Encoding",
+		"Cache-Control",
+		"ETag",
+		"Last-Modified",
+		"Location",
+		"Vary",
+	}
+
+	// Also forward CORS headers from upstream
+	for name := range upstreamHeaders {
+		if strings.HasPrefix(strings.ToLower(name), "access-control-") {
+			safeHeaders = append(safeHeaders, name)
+		}
+	}
+
+	for _, header := range safeHeaders {
+		if values, ok := upstreamHeaders[header]; ok {
+			for _, value := range values {
+				w.Header().Add(header, value)
+			}
+		}
+	}
+}
+
+// isPrivateIP checks if an IP is private or loopback
+func isPrivateIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	if ipv4 := ip.To4(); ipv4 != nil {
+		return ipv4[0] == 10 ||
+			(ipv4[0] == 172 && ipv4[1] >= 16 && ipv4[1] <= 31) ||
+			(ipv4[0] == 192 && ipv4[1] == 168)
+	}
+	return len(ip) == net.IPv6len && (ip[0]&0xfe) == 0xfc
 }
